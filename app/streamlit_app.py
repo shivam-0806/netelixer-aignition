@@ -21,6 +21,7 @@ from src.ingestion import load_google, load_bing, load_meta, harmonize
 from src.forecasting import (
     prepare_forecast_input, train_prophet, forecast_prophet,
     train_quantile_models, simulate_budget, run_full_simulation,
+    run_backtest_all_channels,
 )
 from src.llm import build_forecast_prompt, generate_causal_summary, build_historical_summary
 from src.utils import validate_campaigns, compute_channel_metrics
@@ -660,11 +661,12 @@ def main():
         return
 
     # ─── Tabs ───
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Data Validation",
         "Forecast Outputs",
         "Campaign Breakdown",
         "AI Insights",
+        "Model Confidence",
     ])
 
     # ─── Tab 1: Validation ───
@@ -806,6 +808,319 @@ def main():
 
         with st.expander("View LLM Prompt (debug)", expanded=False):
             st.code(prompt, language="text")
+
+    # ─── Tab 5: Model Confidence ───
+    with tab5:
+        st.markdown("## Model Confidence & Backtest Results")
+        st.caption(
+            "Walk-forward cross-validation — the models are retrained on expanding windows of "
+            "historical data and tested against actual outcomes to measure accuracy."
+        )
+
+        # Check if we already have cached backtest results
+        cache_key = f"backtest_{horizon}"
+        if cache_key not in st.session_state:
+            backtest_progress = st.progress(0, text="Preparing backtest...")
+
+            def _progress(i, total, channel_name):
+                pct = min(i / max(total, 1), 1.0)
+                if i < total:
+                    backtest_progress.progress(pct, text=f"Backtesting {channel_name}...")
+                else:
+                    backtest_progress.progress(1.0, text="Backtest complete!")
+
+            with st.spinner("Running walk-forward backtests (this may take a minute)..."):
+                bt_results = run_backtest_all_channels(
+                    weekly_df, channels_present, horizon, progress_callback=_progress
+                )
+            st.session_state[cache_key] = bt_results
+            backtest_progress.empty()
+        else:
+            bt_results = st.session_state[cache_key]
+
+        overall = bt_results.get("overall", {})
+        overall_score = overall.get("confidence_score", 0)
+        overall_label = overall.get("confidence_label", "N/A")
+
+        # ── Overall Confidence Gauge ──
+        if overall_score >= 90:
+            gauge_color = "#48bb78"
+            bg_glow = "rgba(72, 187, 120, 0.12)"
+        elif overall_score >= 70:
+            gauge_color = "#68d391"
+            bg_glow = "rgba(104, 211, 145, 0.10)"
+        elif overall_score >= 50:
+            gauge_color = "#f6ad55"
+            bg_glow = "rgba(246, 173, 85, 0.10)"
+        else:
+            gauge_color = "#fc8181"
+            bg_glow = "rgba(252, 129, 129, 0.10)"
+
+        gauge_fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=overall_score,
+            number=dict(suffix="", font=dict(size=52, color="#e2e8f0", family="Inter")),
+            gauge=dict(
+                axis=dict(range=[0, 100], tickcolor="#4a5568",
+                          tickfont=dict(color="#718096", size=11),
+                          tickvals=[0, 25, 50, 75, 100]),
+                bar=dict(color=gauge_color, thickness=0.35),
+                bgcolor="rgba(0,0,0,0)",
+                borderwidth=0,
+                steps=[
+                    dict(range=[0, 50], color="rgba(252,129,129,0.08)"),
+                    dict(range=[50, 70], color="rgba(246,173,85,0.08)"),
+                    dict(range=[70, 90], color="rgba(104,211,145,0.08)"),
+                    dict(range=[90, 100], color="rgba(72,187,120,0.12)"),
+                ],
+                threshold=dict(
+                    line=dict(color="#e2e8f0", width=3),
+                    value=overall_score,
+                ),
+            ),
+            title=dict(
+                text=f"Overall Model Confidence — {overall_label}",
+                font=dict(size=16, color="#a0aec0", family="Inter"),
+            ),
+        ))
+        gauge_fig.update_layout(height=300, **CHART_LAYOUT)
+
+        gauge_col, stats_col = st.columns([2, 3])
+
+        with gauge_col:
+            st.plotly_chart(gauge_fig, use_container_width=True)
+
+        with stats_col:
+            st.markdown(
+                f'<div style="padding:24px;background:{bg_glow};'
+                f'border-radius:16px;border:1px solid rgba(255,255,255,0.06);margin-top:12px;">'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:20px;text-align:center;">'
+                f'<div>'
+                f'  <div style="color:#718096;font-size:11px;text-transform:uppercase;letter-spacing:1px;">MAE</div>'
+                f'  <div style="color:#e2e8f0;font-size:22px;font-weight:700;margin-top:4px;">${overall.get("mae", 0):,.0f}</div>'
+                f'  <div style="color:#718096;font-size:11px;">avg error ($)</div>'
+                f'</div>'
+                f'<div>'
+                f'  <div style="color:#718096;font-size:11px;text-transform:uppercase;letter-spacing:1px;">MAPE</div>'
+                f'  <div style="color:#e2e8f0;font-size:22px;font-weight:700;margin-top:4px;">{overall.get("mape", 0):.1f}%</div>'
+                f'  <div style="color:#718096;font-size:11px;">avg % error</div>'
+                f'</div>'
+                f'<div>'
+                f'  <div style="color:#718096;font-size:11px;text-transform:uppercase;letter-spacing:1px;">Coverage</div>'
+                f'  <div style="color:#e2e8f0;font-size:22px;font-weight:700;margin-top:4px;">{overall.get("coverage", 0):.0f}%</div>'
+                f'  <div style="color:#718096;font-size:11px;">in P10–P90 band</div>'
+                f'</div>'
+                f'<div>'
+                f'  <div style="color:#718096;font-size:11px;text-transform:uppercase;letter-spacing:1px;">Direction</div>'
+                f'  <div style="color:#e2e8f0;font-size:22px;font-weight:700;margin-top:4px;">{overall.get("directional_accuracy", 0):.0f}%</div>'
+                f'  <div style="color:#718096;font-size:11px;">trend accuracy</div>'
+                f'</div>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+
+            # Interpretation block
+            if overall_score >= 90:
+                st.success(
+                    "**Excellent** — The model closely tracks actual revenue. "
+                    "Forecasts are highly reliable for budget planning."
+                )
+            elif overall_score >= 70:
+                st.info(
+                    "**Good** — Predictions are trustworthy overall. Some variance exists, "
+                    "but the model captures the general trends well."
+                )
+            elif overall_score >= 50:
+                st.warning(
+                    "**Fair** — Use forecasts with caution. Consider widening safety margins "
+                    "in budget allocation. More historical data would improve accuracy."
+                )
+            else:
+                st.error(
+                    "**Poor** — The model struggles to predict revenue accurately. "
+                    "This often happens with limited data, volatile channels, or major spend changes. "
+                    "Treat forecasts as directional guidance only."
+                )
+
+        st.markdown("---")
+
+        # ── Per-Channel Cards ──
+        st.markdown("### Channel-Level Backtest Metrics")
+        ch_bt_cols = st.columns(len(channels_present))
+
+        for idx, channel in enumerate(channels_present):
+            ch_bt = bt_results.get(channel, {})
+            bm = ch_bt.get("blended_metrics", {})
+            ch_score = bm.get("confidence_score", 0)
+            ch_label = bm.get("confidence_label", "N/A")
+            ch_color = CHANNEL_COLORS.get(channel, "#888")
+
+            if ch_score >= 70:
+                badge_bg = "rgba(72,187,120,0.15)"
+                badge_border = "rgba(72,187,120,0.4)"
+            elif ch_score >= 50:
+                badge_bg = "rgba(246,173,85,0.15)"
+                badge_border = "rgba(246,173,85,0.4)"
+            else:
+                badge_bg = "rgba(252,129,129,0.15)"
+                badge_border = "rgba(252,129,129,0.4)"
+
+            # Coverage bar width
+            cov_width = min(bm.get("coverage", 0), 100)
+            cov_color = "#48bb78" if cov_width >= 80 else ("#f6ad55" if cov_width >= 60 else "#fc8181")
+
+            with ch_bt_cols[idx]:
+                st.markdown(
+                    f'<div style="padding:20px;background:rgba(255,255,255,0.03);'
+                    f'border-radius:14px;border-top:3px solid {ch_color};margin-bottom:12px;">'
+                    f'<h3 style="text-align:center;margin:0 0 8px 0;">{channel}</h3>'
+                    f'<div style="text-align:center;margin-bottom:16px;">'
+                    f'  <span style="display:inline-block;padding:6px 16px;background:{badge_bg};'
+                    f'  border:1px solid {badge_border};border-radius:20px;'
+                    f'  font-size:20px;font-weight:700;color:#e2e8f0;">{ch_score}</span>'
+                    f'  <div style="color:#718096;font-size:12px;margin-top:4px;">{ch_label}</div>'
+                    f'</div>'
+                    f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px;">'
+                    f'  <div style="color:#718096;">MAE</div>'
+                    f'  <div style="color:#e2e8f0;text-align:right;font-weight:600;">${bm.get("mae", 0):,.0f}</div>'
+                    f'  <div style="color:#718096;">MAPE</div>'
+                    f'  <div style="color:#e2e8f0;text-align:right;font-weight:600;">{bm.get("mape", 0):.1f}%</div>'
+                    f'  <div style="color:#718096;">RMSE</div>'
+                    f'  <div style="color:#e2e8f0;text-align:right;font-weight:600;">${bm.get("rmse", 0):,.0f}</div>'
+                    f'  <div style="color:#718096;">Direction</div>'
+                    f'  <div style="color:#e2e8f0;text-align:right;font-weight:600;">{bm.get("directional_accuracy", 0):.0f}%</div>'
+                    f'  <div style="color:#718096;">Folds</div>'
+                    f'  <div style="color:#e2e8f0;text-align:right;font-weight:600;">{bm.get("n_folds", 0)}</div>'
+                    f'</div>'
+                    f'<div style="margin-top:12px;">'
+                    f'  <div style="color:#718096;font-size:11px;margin-bottom:4px;">Coverage ({cov_width:.0f}%)</div>'
+                    f'  <div style="position:relative;height:8px;background:rgba(255,255,255,0.06);border-radius:4px;overflow:hidden;">'
+                    f'    <div style="position:absolute;left:0;top:0;height:100%;width:{cov_width}%;'
+                    f'    background:{cov_color};border-radius:4px;transition:width 0.5s ease;"></div>'
+                    f'    <div style="position:absolute;left:80%;top:-3px;width:1px;height:14px;'
+                    f'    background:rgba(255,255,255,0.3);" title="80% target"></div>'
+                    f'  </div>'
+                    f'</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown("---")
+
+        # ── Actual vs. Predicted Charts ──
+        st.markdown("### Actual vs. Predicted — Backtest Folds")
+
+        for channel in channels_present:
+            ch_bt = bt_results.get(channel, {})
+            blended_folds = ch_bt.get("blended_folds", [])
+            if not blended_folds:
+                continue
+
+            ch_color = CHANNEL_COLORS.get(channel, "#888")
+
+            fold_labels = [f"Fold {i+1}\n{f['test_start']}" for i, f in enumerate(blended_folds)]
+            actuals = [f["actual"] for f in blended_folds]
+            preds = [f["predicted"] for f in blended_folds]
+            lows = [f["pred_low"] for f in blended_folds]
+            highs = [f["pred_high"] for f in blended_folds]
+
+            avp_fig = go.Figure()
+
+            # Confidence band
+            avp_fig.add_trace(go.Scatter(
+                x=fold_labels + fold_labels[::-1],
+                y=highs + lows[::-1],
+                fill="toself",
+                fillcolor=f"rgba({int(ch_color[1:3], 16)},{int(ch_color[3:5], 16)},{int(ch_color[5:7], 16)},0.12)",
+                line=dict(color="rgba(0,0,0,0)"),
+                name="P10–P90 Range",
+                showlegend=True,
+            ))
+
+            # Actual line
+            avp_fig.add_trace(go.Scatter(
+                x=fold_labels, y=actuals,
+                mode="lines+markers",
+                name="Actual Revenue",
+                line=dict(color="#e2e8f0", width=2.5),
+                marker=dict(size=8, color="#e2e8f0", line=dict(width=1, color="#fff")),
+            ))
+
+            # Predicted line
+            avp_fig.add_trace(go.Scatter(
+                x=fold_labels, y=preds,
+                mode="lines+markers",
+                name="Predicted (Blended)",
+                line=dict(color=ch_color, width=2.5, dash="dash"),
+                marker=dict(size=8, color=ch_color, symbol="diamond",
+                            line=dict(width=1, color="#fff")),
+            ))
+
+            avp_fig.update_layout(
+                title=dict(text=f"{channel} — Actual vs. Predicted", font=dict(size=16)),
+                yaxis_title="Revenue ($)",
+                xaxis_title="Backtest Fold",
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=-0.35, x=0.5, xanchor="center"),
+                height=380,
+                **CHART_LAYOUT,
+            )
+            avp_fig.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
+
+            st.plotly_chart(avp_fig, use_container_width=True)
+
+        # ── Fold Detail Table ──
+        with st.expander("Fold-by-Fold Detail", expanded=False):
+            all_folds_data = []
+            for channel in channels_present:
+                ch_bt = bt_results.get(channel, {})
+                for i, fold in enumerate(ch_bt.get("blended_folds", [])):
+                    error = fold["actual"] - fold["predicted"]
+                    pct_error = (abs(error) / fold["actual"] * 100) if fold["actual"] != 0 else 0
+                    in_band = "✅" if fold["pred_low"] <= fold["actual"] <= fold["pred_high"] else "❌"
+                    all_folds_data.append({
+                        "Channel": channel,
+                        "Fold": i + 1,
+                        "Train Period": f"{fold['train_start']} → {fold['train_end']}",
+                        "Test Period": f"{fold['test_start']} → {fold['test_end']}",
+                        "Actual ($)": fold["actual"],
+                        "Predicted ($)": fold["predicted"],
+                        "Error ($)": round(error, 2),
+                        "Error (%)": round(pct_error, 1),
+                        "In Band": in_band,
+                    })
+
+            if all_folds_data:
+                folds_df = pd.DataFrame(all_folds_data)
+                st.dataframe(
+                    folds_df.style.format({
+                        "Actual ($)": "${:,.0f}",
+                        "Predicted ($)": "${:,.0f}",
+                        "Error ($)": "${:,.0f}",
+                        "Error (%)": "{:.1f}%",
+                    }),
+                    use_container_width=True,
+                    height=400,
+                )
+            else:
+                st.info("No backtest folds available — not enough historical data.")
+
+        # ── Interpretation Guide ──
+        with st.expander("What do these metrics mean?", expanded=False):
+            st.markdown("""
+            | Metric | What it measures | Good value |
+            |--------|-----------------|------------|
+            | **MAE** | Average dollar error per fold | Lower is better |
+            | **MAPE** | Average percentage error | < 15% is great, < 25% is acceptable |
+            | **RMSE** | Error with extra penalty for large misses | Lower is better |
+            | **Coverage** | % of actuals inside P10–P90 prediction band | ≥ 80% means well-calibrated |
+            | **Directional Accuracy** | Did the model predict up/down correctly? | > 60% is better than chance |
+            | **Confidence Score** | Composite 0–100 score | 90+ Excellent, 70+ Good, 50+ Fair |
+
+            **How backtesting works:** The engine "replays" history — it trains models only on
+            past data, then checks if the forecast matched what actually happened. This gives an
+            honest assessment of model accuracy, unlike training error which can be overly optimistic.
+            """)
 
 
 if __name__ == "__main__":

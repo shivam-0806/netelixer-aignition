@@ -4,10 +4,12 @@ import xgboost as xgb
 import numpy as np
 import pandas as pd
 
+from .features import add_promo_flags
+
 QUANTILES = [0.10, 0.50, 0.90]
 
 FEATURE_COLS = [
-    "spend", "month", "quarter", "week_of_year",
+    "spend", "month", "quarter", "week_of_year", "is_promo",
     "spend_lag1", "spend_lag4", "spend_rolling4",
 ]
 
@@ -15,6 +17,7 @@ FEATURE_COLS = [
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """Feature engineering for the quantile model."""
     df = df.copy()
+    df = add_promo_flags(df)
     df["month"]          = df["week"].dt.month
     df["quarter"]        = df["week"].dt.quarter
     df["week_of_year"]   = df["week"].dt.isocalendar().week.astype(int)
@@ -97,6 +100,7 @@ def simulate_budget(models: dict, planned_spend: float,
         "month":           next_week.month,
         "quarter":         next_week.quarter,
         "week_of_year":    next_week.isocalendar()[1],
+        "is_promo":        1 if (47 <= next_week.isocalendar()[1] <= 50) else 0,
         "spend_lag1":      last_row["spend"],
         "spend_lag4":      channel_df["spend"].iloc[-4:].mean(),
         "spend_rolling4":  channel_df["spend"].iloc[-4:].mean(),
