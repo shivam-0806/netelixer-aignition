@@ -1,6 +1,44 @@
 """Prompt builder — constructs the analyst prompt from structured data."""
 
 
+def _format_money(value) -> str:
+    """Format a numeric value as whole-dollar text."""
+    return f"${float(value):,.0f}"
+
+
+def _format_validation_summary(validation_report: dict) -> str:
+    """Build compact data-quality context for the LLM."""
+    # Original:
+    # - Zero-revenue campaigns with active spend: {validation_report.get('zero_revenue_campaigns', [])}
+    # This dumped very large campaign lists into the prompt. Use summarized
+    # validation fields instead so the model focuses on business implications.
+    lines = [
+        f"- Duplicate rows found: {validation_report.get('duplicate_rows', 0)}",
+        f"- Zero-revenue campaigns with active spend: "
+        f"{validation_report.get('zero_revenue_campaign_count', 0)} campaigns / "
+        f"{validation_report.get('zero_revenue_rows', 0)} rows",
+        f"- Zero-spend rows: {validation_report.get('zero_spend_rows', 0)}",
+        f"- Extreme row-level ROAS outliers: {validation_report.get('extreme_roas_rows', 0)}",
+        f"- Missing observed dates by channel: "
+        f"{validation_report.get('missing_dates_by_channel', {})}",
+        f"- Estimated revenue rows by channel: "
+        f"{validation_report.get('estimated_revenue_rows_by_channel', {})}",
+        f"- Revenue sources by channel: "
+        f"{validation_report.get('revenue_sources_by_channel', {})}",
+    ]
+
+    top_zero_revenue = validation_report.get("zero_revenue_top_spend", [])[:5]
+    if top_zero_revenue:
+        lines.append("- Top zero-revenue spend concentrations:")
+        for row in top_zero_revenue:
+            lines.append(
+                f"  - {row.get('channel')}: {row.get('campaign_name')} "
+                f"spent {_format_money(row.get('spend', 0))} with zero revenue"
+            )
+
+    return "\n".join(lines)
+
+
 def build_forecast_prompt(
     historical_summary: dict,
     forecast_results:   dict,
@@ -38,6 +76,7 @@ def build_forecast_prompt(
     channel_text = "\n".join(channel_lines)
 
     blended = fc["blended"]
+    validation_text = _format_validation_summary(validation_report)
 
     return f"""You are a senior digital marketing analyst at a performance agency.
 You have been given historical advertising data and a probabilistic forecast for the next {horizon_days} days.
@@ -52,8 +91,13 @@ Channel-Level Averages (last 90 days):
 {hist['channel_avg_table']}
 
 Known Data Quality Issues:
-- Zero-revenue campaigns with active spend: {validation_report.get('zero_revenue_campaigns', [])}
-- Duplicate rows found: {validation_report.get('duplicate_rows', 0)}
+{validation_text}
+
+Forecast Method Notes:
+- The forecast is an ensemble uncertainty band from Prophet and XGBoost, not a guaranteed statistical confidence interval.
+- Google uses observed ecommerce revenue and has the strongest data quality in this prototype.
+- Google production ranges are calibrated using recent backtest behavior to avoid over-wide bands.
+- Any channel listed under estimated revenue must be described as assumption-based, not observed ecommerce revenue.
 
 --- FORECAST INPUTS ---
 Planning Horizon: {horizon_days} days
@@ -79,4 +123,6 @@ Channel-Level Results:
 5. Flag which channel has the widest uncertainty and explain why.
 
 Write in plain English. Be direct. Do not hedge every sentence. Use numbers from the data above.
+Do not invent causes that are not supported by the supplied metrics.
+When revenue is estimated, explicitly call that out as a limitation.
 Format the output using markdown with clear headers and bullet points for readability."""

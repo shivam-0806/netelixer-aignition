@@ -19,9 +19,11 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 from src.ingestion import load_google, load_bing, load_meta, harmonize
 from src.forecasting import (
-    prepare_forecast_input, train_prophet, forecast_prophet,
-    train_quantile_models, simulate_budget, run_full_simulation,
-    run_backtest_all_channels,
+    # Original:
+    # prepare_forecast_input, train_prophet, forecast_prophet,
+    # train_quantile_models, simulate_budget, run_full_simulation,
+    prepare_forecast_input, train_prophet,
+    train_quantile_models, run_full_simulation,
 )
 from src.llm import build_forecast_prompt, generate_causal_summary, build_historical_summary
 from src.utils import validate_campaigns, compute_channel_metrics
@@ -184,6 +186,40 @@ CHANNEL_COLORS = {
     "Bing":   "#00A4EF",
     "Meta":   "#E1306C",
 }
+
+
+def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    """Return numeric ratio with zero/invalid denominators converted to 0.0."""
+    numerator = pd.to_numeric(numerator, errors="coerce")
+    denominator = pd.to_numeric(denominator, errors="coerce").replace(0, float("nan"))
+    return (numerator / denominator).fillna(0.0).astype(float)
+
+
+def build_unified_dataset(channel_frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Combine loaded channel frames and derive shared metrics."""
+    frames = [df for df in channel_frames.values() if df is not None and not df.empty]
+    if not frames:
+        return pd.DataFrame()
+
+    # Original:
+    # unified_df = harmonize(google_df, bing_df, meta_df)
+    #
+    # Corrected: Google-first mode may intentionally load only Google. Use the
+    # existing harmonizer when all channels are present, otherwise concatenate
+    # selected channel frames and derive the same shared metric columns.
+    if all(channel in channel_frames and channel_frames[channel] is not None
+           for channel in ("Google", "Bing", "Meta")):
+        return harmonize(
+            channel_frames["Google"],
+            channel_frames["Bing"],
+            channel_frames["Meta"],
+        )
+
+    unified = pd.concat(frames, ignore_index=True)
+    unified["roas"] = _safe_divide(unified["revenue"], unified["spend"])
+    unified["cpc"] = _safe_divide(unified["spend"], unified["clicks"])
+    unified["cvr"] = _safe_divide(unified["conversions"], unified["clicks"])
+    return unified.sort_values("date").reset_index(drop=True)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -364,6 +400,8 @@ def show_campaign_breakdown(unified_df: pd.DataFrame, forecast_results: dict):
         .agg(
             historical_revenue=("revenue", "sum"),
             historical_spend=("spend", "sum"),
+            estimated_revenue_rows=("revenue_is_estimated", "sum"),
+            revenue_source=("revenue_source", lambda values: ", ".join(sorted(map(str, values.dropna().unique())))),
         )
         .reset_index()
     )
@@ -375,22 +413,46 @@ def show_campaign_breakdown(unified_df: pd.DataFrame, forecast_results: dict):
         ch_total_rev = camp_share.loc[ch_mask, "historical_revenue"].sum()
         ch_forecast = forecast_results[channel]["revenue_median"]
 
+        # Original:
+        # if ch_total_rev > 0:
+        #     camp_share.loc[ch_mask, "forecast_revenue"] = (
+        #         (camp_share.loc[ch_mask, "historical_revenue"] / ch_total_rev) * ch_forecast
+        #     )
+        # else:
+        #     camp_share.loc[ch_mask, "forecast_revenue"] = 0
+        #
+        # Corrected: use revenue-share where possible, then spend-share as a
+        # fallback so zero-revenue campaigns/channels still receive a visible
+        # allocation basis.
         if ch_total_rev > 0:
             camp_share.loc[ch_mask, "forecast_revenue"] = (
                 (camp_share.loc[ch_mask, "historical_revenue"] / ch_total_rev) * ch_forecast
             )
+            camp_share.loc[ch_mask, "allocation_basis"] = "Revenue share"
         else:
-            camp_share.loc[ch_mask, "forecast_revenue"] = 0
+            ch_total_spend = camp_share.loc[ch_mask, "historical_spend"].sum()
+            if ch_total_spend > 0:
+                camp_share.loc[ch_mask, "forecast_revenue"] = (
+                    (camp_share.loc[ch_mask, "historical_spend"] / ch_total_spend) * ch_forecast
+                )
+                camp_share.loc[ch_mask, "allocation_basis"] = "Spend share"
+            else:
+                camp_share.loc[ch_mask, "forecast_revenue"] = 0
+                camp_share.loc[ch_mask, "allocation_basis"] = "No spend/revenue"
+
+    camp_share["revenue_is_estimated"] = camp_share["estimated_revenue_rows"] > 0
 
     display_df = (
         camp_share[["channel", "campaign_name", "campaign_type",
-                     "historical_spend", "historical_revenue", "forecast_revenue"]]
+                     "historical_spend", "historical_revenue", "forecast_revenue",
+                     "allocation_basis", "revenue_is_estimated", "revenue_source"]]
         .sort_values("forecast_revenue", ascending=False)
         .reset_index(drop=True)
     )
 
     display_df.columns = ["Channel", "Campaign", "Type",
-                          "Hist. Spend ($)", "Hist. Revenue ($)", "Forecast Revenue ($)"]
+                          "Hist. Spend ($)", "Hist. Revenue ($)", "Forecast Revenue ($)",
+                          "Allocation Basis", "Revenue Estimated", "Revenue Source"]
 
     st.dataframe(
         display_df.style.format({
@@ -419,8 +481,24 @@ def show_validation_report(report: dict, unified_df: pd.DataFrame):
         st.metric("Duplicate Rows", report.get("duplicate_rows", 0))
 
     with col3:
-        zero_rev = len(report.get("zero_revenue_campaigns", []))
+        # Original:
+        # zero_rev = len(report.get("zero_revenue_campaigns", []))
+        zero_rev = report.get("zero_revenue_campaign_count", len(report.get("zero_revenue_campaigns", [])))
         st.metric("Zero-Revenue Campaigns", zero_rev)
+
+    if report.get("estimated_revenue_rows", 0) > 0:
+        st.warning(
+            f"{report['estimated_revenue_rows']:,} rows use estimated revenue. "
+            "Treat ROAS/revenue for those channels as assumption-based."
+        )
+
+    if report.get("missing_dates_by_channel"):
+        missing_dates = {
+            channel: count for channel, count in report["missing_dates_by_channel"].items()
+            if count > 0
+        }
+        if missing_dates:
+            st.warning(f"Missing observed dates by channel: {missing_dates}")
 
     # Date range coverage
     if "date_range" in report:
@@ -450,13 +528,45 @@ def show_validation_report(report: dict, unified_df: pd.DataFrame):
                     unsafe_allow_html=True,
                 )
 
+    if report.get("revenue_sources_by_channel"):
+        st.markdown("#### Revenue Source by Channel")
+        source_rows = [
+            {"Channel": channel, "Revenue Source": ", ".join(sources)}
+            for channel, sources in report["revenue_sources_by_channel"].items()
+        ]
+        st.dataframe(pd.DataFrame(source_rows), use_container_width=True, hide_index=True)
+
     # Warnings
     if report.get("zero_revenue_campaigns"):
         with st.expander(f"{zero_rev} campaigns with active spend but zero revenue", expanded=False):
-            for camp in report["zero_revenue_campaigns"][:20]:
-                st.markdown(f"- `{camp}`")
-            if zero_rev > 20:
-                st.caption(f"... and {zero_rev - 20} more")
+            # Original:
+            # for camp in report["zero_revenue_campaigns"][:20]:
+            #     st.markdown(f"- `{camp}`")
+            # if zero_rev > 20:
+            #     st.caption(f"... and {zero_rev - 20} more")
+            top_spend = report.get("zero_revenue_top_spend", [])
+            if top_spend:
+                st.caption("Top zero-revenue campaigns by spend")
+                st.dataframe(pd.DataFrame(top_spend), use_container_width=True, hide_index=True)
+            else:
+                for camp in report["zero_revenue_campaigns"][:20]:
+                    st.markdown(f"- `{camp}`")
+                if zero_rev > 20:
+                    st.caption(f"... and {zero_rev - 20} more")
+
+    if report.get("zero_spend_rows", 0) > 0:
+        st.info(
+            f"Found {report['zero_spend_rows']:,} zero-spend rows. "
+            f"By channel: {report.get('zero_spend_rows_by_channel', {})}"
+        )
+
+    if report.get("extreme_roas_rows", 0) > 0:
+        with st.expander(f"{report['extreme_roas_rows']:,} extreme row-level ROAS outliers", expanded=False):
+            st.dataframe(
+                pd.DataFrame(report.get("extreme_roas_top_rows", [])),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     if report.get("negative_spend_rows", 0) > 0:
         st.error(f"Found {report['negative_spend_rows']} rows with negative spend values.")
@@ -556,6 +666,23 @@ def main():
 
         st.markdown("---")
 
+        st.markdown("#### Forecast Scope")
+        forecast_scope = st.radio(
+            "Modeling mode",
+            options=["Google only (recommended)", "All channels"],
+            index=0,
+            key="forecast_scope",
+        )
+        active_channels = ["Google"] if forecast_scope.startswith("Google") else [
+            "Google", "Bing", "Meta"
+        ]
+        if forecast_scope.startswith("Google"):
+            st.caption("Recommended path: observed revenue, complete daily coverage, strongest signal.")
+        else:
+            st.caption("Includes Bing and Meta; Meta revenue is assumption-based unless a revenue field is supplied.")
+
+        st.markdown("---")
+
         st.markdown("#### 📁 Upload Data")
         google_file = st.file_uploader("Google Ads CSV", type=["csv"], key="google_csv")
         bing_file   = st.file_uploader("Bing / MS Ads CSV", type=["csv"], key="bing_csv")
@@ -565,10 +692,21 @@ def main():
         st.markdown("#### Budget Inputs")
         google_budget = st.number_input("Google Ads Budget ($)", min_value=0,
                                         value=50000, step=1000, key="google_budget")
-        bing_budget   = st.number_input("MS Ads Budget ($)", min_value=0,
-                                        value=10000, step=1000, key="bing_budget")
-        meta_budget   = st.number_input("Meta Ads Budget ($)", min_value=0,
-                                        value=30000, step=1000, key="meta_budget")
+        # Original:
+        # bing_budget = st.number_input("MS Ads Budget ($)", min_value=0,
+        #                               value=10000, step=1000, key="bing_budget")
+        # meta_budget = st.number_input("Meta Ads Budget ($)", min_value=0,
+        #                               value=30000, step=1000, key="meta_budget")
+        if "Bing" in active_channels:
+            bing_budget = st.number_input("MS Ads Budget ($)", min_value=0,
+                                          value=10000, step=1000, key="bing_budget")
+        else:
+            bing_budget = 0
+        if "Meta" in active_channels:
+            meta_budget = st.number_input("Meta Ads Budget ($)", min_value=0,
+                                          value=30000, step=1000, key="meta_budget")
+        else:
+            meta_budget = 0
 
         st.markdown("---")
         st.markdown("#### Forecast Window")
@@ -584,42 +722,64 @@ def main():
 
     # ─── Data Loading ───
     data_loaded = False
-    if run_button or st.session_state.get("forecast_ready"):
+    forecast_results = None
+    budget_inputs = None
+
+    # Original:
+    # if run_button or st.session_state.get("forecast_ready"):
+    #
+    # Corrected: only regenerate models when the button is clicked. Otherwise
+    # reuse the previous run from session_state so normal UI interactions do not
+    # repeatedly retrain Prophet/XGBoost.
+    if run_button:
         with st.spinner("Loading and harmonizing data..."):
             try:
                 base_path = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
+                channel_frames = {}
 
                 if google_file:
-                    google_df = load_google(google_file)
+                    channel_frames["Google"] = load_google(google_file)
                 elif use_default and os.path.exists(os.path.join(base_path, "google_ads_campaign_stats.csv")):
-                    google_df = load_google(os.path.join(base_path, "google_ads_campaign_stats.csv"))
+                    channel_frames["Google"] = load_google(os.path.join(base_path, "google_ads_campaign_stats.csv"))
                 else:
                     st.error("Please upload Google Ads CSV or enable sample data.")
                     return
 
-                if bing_file:
-                    bing_df = load_bing(bing_file)
-                elif use_default and os.path.exists(os.path.join(base_path, "bing_campaign_stats.csv")):
-                    bing_df = load_bing(os.path.join(base_path, "bing_campaign_stats.csv"))
-                else:
-                    st.error("Please upload Bing Ads CSV or enable sample data.")
-                    return
+                # Original:
+                # Bing and Meta were always required. In Google-first mode they
+                # are intentionally optional, so the app can run the strongest
+                # observed-revenue path without noisy/estimated channels.
+                if "Bing" in active_channels:
+                    if bing_file:
+                        channel_frames["Bing"] = load_bing(bing_file)
+                    elif use_default and os.path.exists(os.path.join(base_path, "bing_campaign_stats.csv")):
+                        channel_frames["Bing"] = load_bing(os.path.join(base_path, "bing_campaign_stats.csv"))
+                    else:
+                        st.error("Please upload Bing Ads CSV or enable sample data.")
+                        return
 
-                if meta_file:
-                    meta_df = load_meta(meta_file)
-                elif use_default and os.path.exists(os.path.join(base_path, "meta_ads_campaign_stats.csv")):
-                    meta_df = load_meta(os.path.join(base_path, "meta_ads_campaign_stats.csv"))
-                else:
-                    st.error("Please upload Meta Ads CSV or enable sample data.")
-                    return
+                if "Meta" in active_channels:
+                    if meta_file:
+                        channel_frames["Meta"] = load_meta(meta_file)
+                    elif use_default and os.path.exists(os.path.join(base_path, "meta_ads_campaign_stats.csv")):
+                        channel_frames["Meta"] = load_meta(os.path.join(base_path, "meta_ads_campaign_stats.csv"))
+                    else:
+                        st.error("Please upload Meta Ads CSV or enable sample data.")
+                        return
 
-                unified_df = harmonize(google_df, bing_df, meta_df)
+                unified_df = build_unified_dataset(channel_frames)
                 data_loaded = True
 
             except Exception as e:
                 st.error(f"Error loading data: {e}")
                 st.exception(e)
                 return
+    elif st.session_state.get("forecast_ready"):
+        unified_df = st.session_state["unified_df"]
+        forecast_results = st.session_state["forecast_results"]
+        budget_inputs = st.session_state["budget_inputs"]
+        horizon = st.session_state.get("forecast_horizon", horizon)
+        data_loaded = True
 
     if not data_loaded:
         # Landing state
@@ -666,7 +826,7 @@ def main():
         "Forecast Outputs",
         "Campaign Breakdown",
         "AI Insights",
-        "Model Confidence",
+        "Accuracy Analysis",
     ])
 
     # ─── Tab 1: Validation ───
@@ -675,40 +835,51 @@ def main():
         validation_report = validate_campaigns(unified_df)
         show_validation_report(validation_report, unified_df)
 
+        with st.expander("Channel Metrics (last 90 days)", expanded=True):
+            channel_metrics = compute_channel_metrics(unified_df)
+            st.dataframe(channel_metrics, use_container_width=True, hide_index=True)
+
         # Quick data overview
         with st.expander("Preview Unified Data (first 100 rows)", expanded=False):
             st.dataframe(unified_df.head(100), use_container_width=True, height=400)
 
     # ─── Forecasting ───
-    with st.spinner("🔄 Training models and generating forecasts..."):
-        weekly_df = prepare_forecast_input(unified_df, grain="channel")
-        channels_present = unified_df["channel"].unique().tolist()
+    if forecast_results is None:
+        with st.spinner("🔄 Training models and generating forecasts..."):
+            weekly_df = prepare_forecast_input(unified_df, grain="channel")
+            channels_present = unified_df["channel"].unique().tolist()
 
-        budget_inputs = {}
-        if "Google" in channels_present:
-            budget_inputs["Google"] = google_budget
-        if "Bing" in channels_present:
-            budget_inputs["Bing"] = bing_budget
-        if "Meta" in channels_present:
-            budget_inputs["Meta"] = meta_budget
+            budget_inputs = {}
+            if "Google" in channels_present:
+                budget_inputs["Google"] = google_budget
+            if "Bing" in channels_present:
+                budget_inputs["Bing"] = bing_budget
+            if "Meta" in channels_present:
+                budget_inputs["Meta"] = meta_budget
 
-        # Train models
-        prophet_models = {}
-        quantile_models = {}
-        for ch in channels_present:
-            ch_weekly = weekly_df[weekly_df["channel"] == ch]
-            if len(ch_weekly) < 4:
-                st.warning(f"Insufficient data for {ch} (only {len(ch_weekly)} weeks). Skipping.")
-                continue
-            prophet_models[ch] = train_prophet(weekly_df, ch)
-            quantile_models[ch] = train_quantile_models(weekly_df, ch)
+            # Train models
+            prophet_models = {}
+            quantile_models = {}
+            for ch in channels_present:
+                ch_weekly = weekly_df[weekly_df["channel"] == ch]
+                if len(ch_weekly) < 4:
+                    st.warning(f"Insufficient data for {ch} (only {len(ch_weekly)} weeks). Skipping.")
+                    continue
+                prophet_models[ch] = train_prophet(weekly_df, ch)
+                quantile_models[ch] = train_quantile_models(weekly_df, ch)
 
-        # Run simulation
-        forecast_results = run_full_simulation(
-            weekly_df, prophet_models, quantile_models, budget_inputs, horizon
-        )
+            # Run simulation
+            forecast_results = run_full_simulation(
+                weekly_df, prophet_models, quantile_models, budget_inputs, horizon
+            )
 
-        st.session_state["forecast_ready"] = True
+            st.session_state["forecast_ready"] = True
+            st.session_state["unified_df"] = unified_df
+            st.session_state["forecast_results"] = forecast_results
+            st.session_state["budget_inputs"] = budget_inputs
+            st.session_state["forecast_horizon"] = horizon
+    else:
+        st.caption("Showing saved forecast results. Click Generate Forecast to refresh after changing inputs.")
 
     # ─── Tab 2: Forecast Outputs ───
     with tab2:
@@ -726,6 +897,15 @@ def main():
         with kpi4:
             spread = blended["revenue_high"] - blended["revenue_low"]
             st.metric("Uncertainty Range", f"${spread:,.0f}")
+
+        if "revenue_is_estimated" in unified_df.columns and unified_df["revenue_is_estimated"].any():
+            estimated_channels = sorted(
+                unified_df.loc[unified_df["revenue_is_estimated"], "channel"].dropna().unique()
+            )
+            st.warning(
+                "Forecast includes estimated revenue for: "
+                f"{', '.join(estimated_channels)}. Interpret revenue and ROAS for those channels as assumption-based."
+            )
 
         st.markdown("---")
 
@@ -778,8 +958,11 @@ def main():
     with tab3:
         st.markdown("## Campaign-Level Revenue Contribution")
         st.caption(
-            "Forecasted revenue is distributed proportionally across campaigns "
-            "based on their historical revenue share in the last 90 days."
+            # Original:
+            # "Forecasted revenue is distributed proportionally across campaigns "
+            # "based on their historical revenue share in the last 90 days."
+            "Forecasted revenue is allocation-based: historical revenue share is used when available, "
+            "with spend share as the fallback for zero-revenue groups."
         )
         show_campaign_breakdown(unified_df, forecast_results)
 
@@ -790,337 +973,89 @@ def main():
 
         # Check for API key
         if not os.environ.get("GEMINI_API_KEY"):
-            st.error("GEMINI_API_KEY not found in environment. Add it to `.env` file.")
-            return
+            st.warning("Skipping AI Analysis: GEMINI_API_KEY not found in environment. Add it to `.env` file when ready.")
+        else:
+            with st.spinner("Generating AI analysis..."):
+                try:
+                    validation_report = validate_campaigns(unified_df)
+                    hist_summary = build_historical_summary(unified_df)
+                    prompt = build_forecast_prompt(
+                        hist_summary, forecast_results, validation_report, horizon
+                    )
+                    causal_summary = generate_causal_summary(prompt)
+                    show_ai_insights(causal_summary, forecast_results)
+                except Exception as e:
+                    st.error(f"AI analysis failed: {e}")
+                    st.exception(e)
 
-        with st.spinner("Generating AI analysis..."):
-            try:
-                validation_report = validate_campaigns(unified_df)
-                hist_summary = build_historical_summary(unified_df)
-                prompt = build_forecast_prompt(
-                    hist_summary, forecast_results, validation_report, horizon
-                )
-                causal_summary = generate_causal_summary(prompt)
-                show_ai_insights(causal_summary, forecast_results)
-            except Exception as e:
-                st.error(f"AI analysis failed: {e}")
-                st.exception(e)
+            with st.expander("View LLM Prompt (debug)", expanded=False):
+                if 'prompt' in locals():
+                    st.code(prompt, language="text")
 
-        with st.expander("View LLM Prompt (debug)", expanded=False):
-            st.code(prompt, language="text")
-
-    # ─── Tab 5: Model Confidence ───
+    # ─── Tab 5: Accuracy Analysis ───
     with tab5:
-        st.markdown("## Model Confidence & Backtest Results")
-        st.caption(
-            "Walk-forward cross-validation — the models are retrained on expanding windows of "
-            "historical data and tested against actual outcomes to measure accuracy."
-        )
+        st.markdown("## Accuracy Analysis & Backtesting")
+        st.caption("Run sliding-window backtests on historical data to evaluate model accuracy without leaking future data.")
 
-        # Check if we already have cached backtest results
-        cache_key = f"backtest_{horizon}"
-        if cache_key not in st.session_state:
-            backtest_progress = st.progress(0, text="Preparing backtest...")
-
-            def _progress(i, total, channel_name):
-                pct = min(i / max(total, 1), 1.0)
-                if i < total:
-                    backtest_progress.progress(pct, text=f"Backtesting {channel_name}...")
-                else:
-                    backtest_progress.progress(1.0, text="Backtest complete!")
-
-            with st.spinner("Running walk-forward backtests (this may take a minute)..."):
-                bt_results = run_backtest_all_channels(
-                    weekly_df, channels_present, horizon, progress_callback=_progress
-                )
-            st.session_state[cache_key] = bt_results
-            backtest_progress.empty()
-        else:
-            bt_results = st.session_state[cache_key]
-
-        overall = bt_results.get("overall", {})
-        overall_score = overall.get("confidence_score", 0)
-        overall_label = overall.get("confidence_label", "N/A")
-
-        # ── Overall Confidence Gauge ──
-        if overall_score >= 90:
-            gauge_color = "#48bb78"
-            bg_glow = "rgba(72, 187, 120, 0.12)"
-        elif overall_score >= 70:
-            gauge_color = "#68d391"
-            bg_glow = "rgba(104, 211, 145, 0.10)"
-        elif overall_score >= 50:
-            gauge_color = "#f6ad55"
-            bg_glow = "rgba(246, 173, 85, 0.10)"
-        else:
-            gauge_color = "#fc8181"
-            bg_glow = "rgba(252, 129, 129, 0.10)"
-
-        gauge_fig = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=overall_score,
-            number=dict(suffix="", font=dict(size=52, color="#e2e8f0", family="Inter")),
-            gauge=dict(
-                axis=dict(range=[0, 100], tickcolor="#4a5568",
-                          tickfont=dict(color="#718096", size=11),
-                          tickvals=[0, 25, 50, 75, 100]),
-                bar=dict(color=gauge_color, thickness=0.35),
-                bgcolor="rgba(0,0,0,0)",
-                borderwidth=0,
-                steps=[
-                    dict(range=[0, 50], color="rgba(252,129,129,0.08)"),
-                    dict(range=[50, 70], color="rgba(246,173,85,0.08)"),
-                    dict(range=[70, 90], color="rgba(104,211,145,0.08)"),
-                    dict(range=[90, 100], color="rgba(72,187,120,0.12)"),
-                ],
-                threshold=dict(
-                    line=dict(color="#e2e8f0", width=3),
-                    value=overall_score,
-                ),
-            ),
-            title=dict(
-                text=f"Overall Model Confidence — {overall_label}",
-                font=dict(size=16, color="#a0aec0", family="Inter"),
-            ),
-        ))
-        gauge_fig.update_layout(height=300, **CHART_LAYOUT)
-
-        gauge_col, stats_col = st.columns([2, 3])
-
-        with gauge_col:
-            st.plotly_chart(gauge_fig, use_container_width=True)
-
-        with stats_col:
-            st.markdown(
-                f'<div style="padding:24px;background:{bg_glow};'
-                f'border-radius:16px;border:1px solid rgba(255,255,255,0.06);margin-top:12px;">'
-                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:20px;text-align:center;">'
-                f'<div>'
-                f'  <div style="color:#718096;font-size:11px;text-transform:uppercase;letter-spacing:1px;">MAE</div>'
-                f'  <div style="color:#e2e8f0;font-size:22px;font-weight:700;margin-top:4px;">${overall.get("mae", 0):,.0f}</div>'
-                f'  <div style="color:#718096;font-size:11px;">avg error ($)</div>'
-                f'</div>'
-                f'<div>'
-                f'  <div style="color:#718096;font-size:11px;text-transform:uppercase;letter-spacing:1px;">MAPE</div>'
-                f'  <div style="color:#e2e8f0;font-size:22px;font-weight:700;margin-top:4px;">{overall.get("mape", 0):.1f}%</div>'
-                f'  <div style="color:#718096;font-size:11px;">avg % error</div>'
-                f'</div>'
-                f'<div>'
-                f'  <div style="color:#718096;font-size:11px;text-transform:uppercase;letter-spacing:1px;">Coverage</div>'
-                f'  <div style="color:#e2e8f0;font-size:22px;font-weight:700;margin-top:4px;">{overall.get("coverage", 0):.0f}%</div>'
-                f'  <div style="color:#718096;font-size:11px;">in P10–P90 band</div>'
-                f'</div>'
-                f'<div>'
-                f'  <div style="color:#718096;font-size:11px;text-transform:uppercase;letter-spacing:1px;">Direction</div>'
-                f'  <div style="color:#e2e8f0;font-size:22px;font-weight:700;margin-top:4px;">{overall.get("directional_accuracy", 0):.0f}%</div>'
-                f'  <div style="color:#718096;font-size:11px;">trend accuracy</div>'
-                f'</div>'
-                f'</div></div>',
-                unsafe_allow_html=True,
+        # Let the user pick the channel and parameters
+        col1, col2 = st.columns(2)
+        with col1:
+            # Original:
+            # test_channel = st.selectbox("Select Channel to Test", ["Google", "Bing", "Meta"])
+            available_backtest_channels = unified_df["channel"].dropna().unique().tolist()
+            available_backtest_channels = sorted(
+                available_backtest_channels,
+                key=lambda channel: 0 if channel == "Google" else 1,
             )
+            test_channel = st.selectbox("Select Channel to Test", available_backtest_channels)
+            if test_channel == "Meta":
+                st.caption("Meta backtests use estimated revenue unless the input file contains observed revenue.")
+        with col2:
+            test_windows = st.number_input("Number of 30-day Windows to Test", min_value=1, max_value=6, value=3)
 
-            # Interpretation block
-            if overall_score >= 90:
-                st.success(
-                    "**Excellent** — The model closely tracks actual revenue. "
-                    "Forecasts are highly reliable for budget planning."
-                )
-            elif overall_score >= 70:
-                st.info(
-                    "**Good** — Predictions are trustworthy overall. Some variance exists, "
-                    "but the model captures the general trends well."
-                )
-            elif overall_score >= 50:
-                st.warning(
-                    "**Fair** — Use forecasts with caution. Consider widening safety margins "
-                    "in budget allocation. More historical data would improve accuracy."
-                )
+        if st.button("🚀 Run Accuracy Backtest", type="primary"):
+            with st.spinner(f"Running {test_windows} sliding windows for {test_channel}..."):
+                try:
+                    from src.forecasting.backtester import run_channel_backtest
+                    
+                    # Run the engine
+                    results = run_channel_backtest(unified_df, test_channel, horizon_days=30, windows=test_windows)
+                    
+                    # Save to session state so it doesn't vanish
+                    st.session_state["backtest_results"] = results
+                except Exception as e:
+                    st.error(f"Backtest failed to execute: {e}")
+
+        # Display results if they exist in session state
+        if "backtest_results" in st.session_state:
+            res = st.session_state["backtest_results"]
+            metrics = res.get("metrics", {})
+
+            st.markdown("---")
+            st.markdown(f"### Backtest Results: {res.get('channel', 'Unknown')}")
+            
+            if not metrics:
+                st.warning("Not enough historical data to complete the backtest windows.")
             else:
-                st.error(
-                    "**Poor** — The model struggles to predict revenue accurately. "
-                    "This often happens with limited data, volatile channels, or major spend changes. "
-                    "Treat forecasts as directional guidance only."
-                )
+                m1, m2, m3 = st.columns(3)
+                
+                # Format AAPE as a percentage
+                aape_pct = metrics['aape'] * 100
+                with m1:
+                    st.metric("AAPE (Error Rate)", f"{aape_pct:.1f}%", 
+                              delta="Aim for < 15%", delta_color="off")
+                
+                # Format Coverage as a percentage
+                cov_pct = metrics['coverage_prob'] * 100
+                with m2:
+                    st.metric("Interval Coverage", f"{cov_pct:.0f}%", 
+                              delta="Aim for ~ 80%", delta_color="off")
+                
+                with m3:
+                    st.metric("Windows Tested", metrics["windows_tested"])
 
-        st.markdown("---")
-
-        # ── Per-Channel Cards ──
-        st.markdown("### Channel-Level Backtest Metrics")
-        ch_bt_cols = st.columns(len(channels_present))
-
-        for idx, channel in enumerate(channels_present):
-            ch_bt = bt_results.get(channel, {})
-            bm = ch_bt.get("blended_metrics", {})
-            ch_score = bm.get("confidence_score", 0)
-            ch_label = bm.get("confidence_label", "N/A")
-            ch_color = CHANNEL_COLORS.get(channel, "#888")
-
-            if ch_score >= 70:
-                badge_bg = "rgba(72,187,120,0.15)"
-                badge_border = "rgba(72,187,120,0.4)"
-            elif ch_score >= 50:
-                badge_bg = "rgba(246,173,85,0.15)"
-                badge_border = "rgba(246,173,85,0.4)"
-            else:
-                badge_bg = "rgba(252,129,129,0.15)"
-                badge_border = "rgba(252,129,129,0.4)"
-
-            # Coverage bar width
-            cov_width = min(bm.get("coverage", 0), 100)
-            cov_color = "#48bb78" if cov_width >= 80 else ("#f6ad55" if cov_width >= 60 else "#fc8181")
-
-            with ch_bt_cols[idx]:
-                st.markdown(
-                    f'<div style="padding:20px;background:rgba(255,255,255,0.03);'
-                    f'border-radius:14px;border-top:3px solid {ch_color};margin-bottom:12px;">'
-                    f'<h3 style="text-align:center;margin:0 0 8px 0;">{channel}</h3>'
-                    f'<div style="text-align:center;margin-bottom:16px;">'
-                    f'  <span style="display:inline-block;padding:6px 16px;background:{badge_bg};'
-                    f'  border:1px solid {badge_border};border-radius:20px;'
-                    f'  font-size:20px;font-weight:700;color:#e2e8f0;">{ch_score}</span>'
-                    f'  <div style="color:#718096;font-size:12px;margin-top:4px;">{ch_label}</div>'
-                    f'</div>'
-                    f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px;">'
-                    f'  <div style="color:#718096;">MAE</div>'
-                    f'  <div style="color:#e2e8f0;text-align:right;font-weight:600;">${bm.get("mae", 0):,.0f}</div>'
-                    f'  <div style="color:#718096;">MAPE</div>'
-                    f'  <div style="color:#e2e8f0;text-align:right;font-weight:600;">{bm.get("mape", 0):.1f}%</div>'
-                    f'  <div style="color:#718096;">RMSE</div>'
-                    f'  <div style="color:#e2e8f0;text-align:right;font-weight:600;">${bm.get("rmse", 0):,.0f}</div>'
-                    f'  <div style="color:#718096;">Direction</div>'
-                    f'  <div style="color:#e2e8f0;text-align:right;font-weight:600;">{bm.get("directional_accuracy", 0):.0f}%</div>'
-                    f'  <div style="color:#718096;">Folds</div>'
-                    f'  <div style="color:#e2e8f0;text-align:right;font-weight:600;">{bm.get("n_folds", 0)}</div>'
-                    f'</div>'
-                    f'<div style="margin-top:12px;">'
-                    f'  <div style="color:#718096;font-size:11px;margin-bottom:4px;">Coverage ({cov_width:.0f}%)</div>'
-                    f'  <div style="position:relative;height:8px;background:rgba(255,255,255,0.06);border-radius:4px;overflow:hidden;">'
-                    f'    <div style="position:absolute;left:0;top:0;height:100%;width:{cov_width}%;'
-                    f'    background:{cov_color};border-radius:4px;transition:width 0.5s ease;"></div>'
-                    f'    <div style="position:absolute;left:80%;top:-3px;width:1px;height:14px;'
-                    f'    background:rgba(255,255,255,0.3);" title="80% target"></div>'
-                    f'  </div>'
-                    f'</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-        st.markdown("---")
-
-        # ── Actual vs. Predicted Charts ──
-        st.markdown("### Actual vs. Predicted — Backtest Folds")
-
-        for channel in channels_present:
-            ch_bt = bt_results.get(channel, {})
-            blended_folds = ch_bt.get("blended_folds", [])
-            if not blended_folds:
-                continue
-
-            ch_color = CHANNEL_COLORS.get(channel, "#888")
-
-            fold_labels = [f"Fold {i+1}\n{f['test_start']}" for i, f in enumerate(blended_folds)]
-            actuals = [f["actual"] for f in blended_folds]
-            preds = [f["predicted"] for f in blended_folds]
-            lows = [f["pred_low"] for f in blended_folds]
-            highs = [f["pred_high"] for f in blended_folds]
-
-            avp_fig = go.Figure()
-
-            # Confidence band
-            avp_fig.add_trace(go.Scatter(
-                x=fold_labels + fold_labels[::-1],
-                y=highs + lows[::-1],
-                fill="toself",
-                fillcolor=f"rgba({int(ch_color[1:3], 16)},{int(ch_color[3:5], 16)},{int(ch_color[5:7], 16)},0.12)",
-                line=dict(color="rgba(0,0,0,0)"),
-                name="P10–P90 Range",
-                showlegend=True,
-            ))
-
-            # Actual line
-            avp_fig.add_trace(go.Scatter(
-                x=fold_labels, y=actuals,
-                mode="lines+markers",
-                name="Actual Revenue",
-                line=dict(color="#e2e8f0", width=2.5),
-                marker=dict(size=8, color="#e2e8f0", line=dict(width=1, color="#fff")),
-            ))
-
-            # Predicted line
-            avp_fig.add_trace(go.Scatter(
-                x=fold_labels, y=preds,
-                mode="lines+markers",
-                name="Predicted (Blended)",
-                line=dict(color=ch_color, width=2.5, dash="dash"),
-                marker=dict(size=8, color=ch_color, symbol="diamond",
-                            line=dict(width=1, color="#fff")),
-            ))
-
-            avp_fig.update_layout(
-                title=dict(text=f"{channel} — Actual vs. Predicted", font=dict(size=16)),
-                yaxis_title="Revenue ($)",
-                xaxis_title="Backtest Fold",
-                showlegend=True,
-                legend=dict(orientation="h", yanchor="bottom", y=-0.35, x=0.5, xanchor="center"),
-                height=380,
-                **CHART_LAYOUT,
-            )
-            avp_fig.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
-
-            st.plotly_chart(avp_fig, use_container_width=True)
-
-        # ── Fold Detail Table ──
-        with st.expander("Fold-by-Fold Detail", expanded=False):
-            all_folds_data = []
-            for channel in channels_present:
-                ch_bt = bt_results.get(channel, {})
-                for i, fold in enumerate(ch_bt.get("blended_folds", [])):
-                    error = fold["actual"] - fold["predicted"]
-                    pct_error = (abs(error) / fold["actual"] * 100) if fold["actual"] != 0 else 0
-                    in_band = "✅" if fold["pred_low"] <= fold["actual"] <= fold["pred_high"] else "❌"
-                    all_folds_data.append({
-                        "Channel": channel,
-                        "Fold": i + 1,
-                        "Train Period": f"{fold['train_start']} → {fold['train_end']}",
-                        "Test Period": f"{fold['test_start']} → {fold['test_end']}",
-                        "Actual ($)": fold["actual"],
-                        "Predicted ($)": fold["predicted"],
-                        "Error ($)": round(error, 2),
-                        "Error (%)": round(pct_error, 1),
-                        "In Band": in_band,
-                    })
-
-            if all_folds_data:
-                folds_df = pd.DataFrame(all_folds_data)
-                st.dataframe(
-                    folds_df.style.format({
-                        "Actual ($)": "${:,.0f}",
-                        "Predicted ($)": "${:,.0f}",
-                        "Error ($)": "${:,.0f}",
-                        "Error (%)": "{:.1f}%",
-                    }),
-                    use_container_width=True,
-                    height=400,
-                )
-            else:
-                st.info("No backtest folds available — not enough historical data.")
-
-        # ── Interpretation Guide ──
-        with st.expander("What do these metrics mean?", expanded=False):
-            st.markdown("""
-            | Metric | What it measures | Good value |
-            |--------|-----------------|------------|
-            | **MAE** | Average dollar error per fold | Lower is better |
-            | **MAPE** | Average percentage error | < 15% is great, < 25% is acceptable |
-            | **RMSE** | Error with extra penalty for large misses | Lower is better |
-            | **Coverage** | % of actuals inside P10–P90 prediction band | ≥ 80% means well-calibrated |
-            | **Directional Accuracy** | Did the model predict up/down correctly? | > 60% is better than chance |
-            | **Confidence Score** | Composite 0–100 score | 90+ Excellent, 70+ Good, 50+ Fair |
-
-            **How backtesting works:** The engine "replays" history — it trains models only on
-            past data, then checks if the forecast matched what actually happened. This gives an
-            honest assessment of model accuracy, unlike training error which can be overly optimistic.
-            """)
+                with st.expander("View Raw Window Data", expanded=False):
+                    st.dataframe(pd.DataFrame(res["raw_runs"]), use_container_width=True)
 
 
 if __name__ == "__main__":

@@ -8,8 +8,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Models to try in order of preference
-_MODELS = ["gemini-3.5-flash", "gemini-2.0-flash"]
+# Models to try in order of preference.
+# Original:
+# _MODELS = ["gemini-3.5-flash", "gemini-2.0-flash"]
+#
+# Corrected: allow an environment override and default to broadly available
+# flash models supported by the google-genai SDK used in this project.
+_MODELS = [
+    os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
+    "gemini-2.0-flash",
+]
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 2  # seconds
 
@@ -88,19 +96,47 @@ def build_historical_summary(df: pd.DataFrame) -> dict:
     """
     last_90 = df[df["date"] >= df["date"].max() - pd.Timedelta(days=90)]
 
-    channel_avg = (
+    # Original:
+    # channel_avg = (
+    #     last_90.groupby("channel")
+    #     .agg(
+    #         avg_daily_spend=("spend", "mean"),
+    #         avg_daily_revenue=("revenue", "mean"),
+    #         avg_roas=("roas", "mean"),
+    #         avg_cpc=("cpc", "mean"),
+    #     )
+    #     .round(2)
+    # )
+    #
+    # Corrected: use aggregate ROAS from summed revenue/spend. Row-average ROAS
+    # overweights low-spend rows and can mislead the LLM.
+    channel_summary = (
         last_90.groupby("channel")
         .agg(
+            total_spend=("spend", "sum"),
+            total_revenue=("revenue", "sum"),
+            total_clicks=("clicks", "sum"),
+            total_conversions=("conversions", "sum"),
             avg_daily_spend=("spend", "mean"),
             avg_daily_revenue=("revenue", "mean"),
-            avg_roas=("roas", "mean"),
-            avg_cpc=("cpc", "mean"),
         )
-        .round(2)
     )
+    channel_summary["aggregate_roas"] = (
+        channel_summary["total_revenue"]
+        / channel_summary["total_spend"].replace(0, pd.NA)
+    ).fillna(0.0)
+    channel_summary["cpc"] = (
+        channel_summary["total_spend"]
+        / channel_summary["total_clicks"].replace(0, pd.NA)
+    ).fillna(0.0)
+    channel_summary["cvr"] = (
+        channel_summary["total_conversions"]
+        / channel_summary["total_clicks"].replace(0, pd.NA)
+    ).fillna(0.0)
+    channel_summary = channel_summary.round(2)
 
     return {
         "date_range":        f"{df['date'].min().date()} to {df['date'].max().date()}",
         "channels":          df["channel"].unique().tolist(),
-        "channel_avg_table": channel_avg.to_string(),
+        "channel_avg_table": channel_summary.to_string(),
     }

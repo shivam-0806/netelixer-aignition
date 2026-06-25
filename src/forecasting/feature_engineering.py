@@ -40,7 +40,11 @@ def prepare_forecast_input(df: pd.DataFrame, grain: str = "channel") -> pd.DataF
         .reset_index()
     )
 
-    result["roas"] = result["revenue"] / result["spend"].replace(0, pd.NA)
-    result["roas"] = result["roas"].fillna(0)
+    # Original:
+    # result["roas"] = result["revenue"] / result["spend"].replace(0, pd.NA)
+    # result["roas"] = result["roas"].fillna(0)
+    spend = pd.to_numeric(result["spend"], errors="coerce").replace(0, float("nan"))
+    revenue = pd.to_numeric(result["revenue"], errors="coerce")
+    result["roas"] = (revenue / spend).fillna(0.0).astype(float)
 
     return result

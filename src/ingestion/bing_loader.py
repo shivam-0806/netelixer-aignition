@@ -5,6 +5,7 @@ import pandas as pd
 UNIFIED_COLS = [
     "date", "channel", "campaign_id", "campaign_name", "campaign_type",
     "spend", "revenue", "clicks", "impressions", "conversions", "daily_budget",
+    "revenue_is_estimated", "revenue_source",
 ]
 
 
@@ -36,5 +37,7 @@ def load_bing(filepath) -> pd.DataFrame:
     df["channel"] = "Bing"
     df["campaign_id"] = df["campaign_id"].astype(str)
     df["date"] = pd.to_datetime(df["date"])
+    df["revenue_is_estimated"] = False
+    df["revenue_source"] = "Revenue"
 
     return df[UNIFIED_COLS]

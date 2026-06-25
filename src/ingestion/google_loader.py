@@ -6,6 +6,7 @@ import pandas as pd
 UNIFIED_COLS = [
     "date", "channel", "campaign_id", "campaign_name", "campaign_type",
     "spend", "revenue", "clicks", "impressions", "conversions", "daily_budget",
+    "revenue_is_estimated", "revenue_source",
 ]
 
 
@@ -34,10 +35,13 @@ def load_google(filepath) -> pd.DataFrame:
 
     # Critical: convert micros to standard currency
     df["spend"] = df["spend"] / 1_000_000
-    df["daily_budget"] = df["daily_budget"] / 1_000_000  # budget is also in micros
+    # campaign_budget_amount is already in standard currency in the provided data.
+    df["daily_budget"] = df["daily_budget"]
 
     df["channel"] = "Google"
     df["campaign_id"] = df["campaign_id"].astype(str)
     df["date"] = pd.to_datetime(df["date"])
+    df["revenue_is_estimated"] = False
+    df["revenue_source"] = "metrics_conversions_value"
 
     return df[UNIFIED_COLS]
